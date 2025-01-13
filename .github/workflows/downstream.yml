@@ -1,8 +1,9 @@
 name: Downstream
 
-on: [push, pull_request]
+on: [push, pull_request, workflow_dispatch]
 
-permissions: "read-all"
+permissions:
+  contents: "read"
 
 jobs:
   downstream:
@@ -15,10 +16,12 @@ jobs:
 
     steps:
       - name: "Checkout repository"
-        uses: actions/checkout@3df4ab11eba7bda6032a0b82a6bb43b11571feac # v4.0.0
+        uses: actions/checkout@0ad4b8fadaa221de15dcec353f45205ec38ea70b # v4.1.4
+        with:
+          persist-credentials: false
 
       - name: "Setup Python"
-        uses: actions/setup-python@61a6322f88396a6271a6ee3565807d608ecaddd1 # v4.7.0
+        uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b # v5.3.0
         with:
           python-version: "3.x"
 

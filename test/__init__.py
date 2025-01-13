@@ -10,6 +10,7 @@ import sys
 import typing
 import warnings
 from collections.abc import Sequence
+from functools import wraps
 from importlib.abc import Loader, MetaPathFinder
 from importlib.machinery import ModuleSpec
 from types import ModuleType, TracebackType
@@ -18,32 +19,26 @@ import pytest
 
 try:
     try:
-        import brotlicffi as brotli  # type: ignore[import]
+        import brotlicffi as brotli  # type: ignore[import-not-found]
     except ImportError:
-        import brotli  # type: ignore[import]
+        import brotli  # type: ignore[import-not-found]
 except ImportError:
     brotli = None
 
 try:
-    import zstandard as zstd  # type: ignore[import]
+    import zstandard as _unused_module_zstd  # noqa: F401
 except ImportError:
-    zstd = None
+    HAS_ZSTD = False
+else:
+    HAS_ZSTD = True
 
-import functools
-
-from urllib3 import util
 from urllib3.connectionpool import ConnectionPool
 from urllib3.exceptions import HTTPWarning
-from urllib3.util import ssl_
 
 try:
     import urllib3.contrib.pyopenssl as pyopenssl
 except ImportError:
     pyopenssl = None  # type: ignore[assignment]
-
-if typing.TYPE_CHECKING:
-    import ssl
-    from typing import Literal
 
 
 _RT = typing.TypeVar("_RT")  # return type
@@ -74,7 +69,7 @@ INVALID_SOURCE_ADDRESSES = [(("192.0.2.255", 0), False), (("2001:db8::1", 0), Tr
 # 3. To test our timeout logic by using two different values, eg. by using different
 #    values at the pool level and at the request level.
 SHORT_TIMEOUT = 0.001
-LONG_TIMEOUT = 0.01
+LONG_TIMEOUT = 0.1
 if os.environ.get("CI") or os.environ.get("GITHUB_ACTIONS") == "true":
     LONG_TIMEOUT = 0.5
 
@@ -88,19 +83,6 @@ def _can_resolve(host: str) -> bool:
         return True
     except socket.gaierror:
         return False
-
-
-def has_alpn(ctx_cls: type[ssl.SSLContext] | None = None) -> bool:
-    """Detect if ALPN support is enabled."""
-    ctx_cls = ctx_cls or util.SSLContext
-    ctx = ctx_cls(protocol=ssl_.PROTOCOL_TLS)  # type: ignore[misc, attr-defined]
-    try:
-        if hasattr(ctx, "set_alpn_protocols"):
-            ctx.set_alpn_protocols(ssl_.ALPN_PROTOCOLS)
-            return True
-    except NotImplementedError:
-        pass
-    return False
 
 
 # Some systems might not resolve "localhost." correctly.
@@ -145,13 +127,13 @@ def notBrotli() -> typing.Callable[[_TestFuncT], _TestFuncT]:
 
 def onlyZstd() -> typing.Callable[[_TestFuncT], _TestFuncT]:
     return pytest.mark.skipif(
-        zstd is None, reason="only run if a python-zstandard library is installed"
+        not HAS_ZSTD, reason="only run if a python-zstandard library is installed"
     )
 
 
 def notZstd() -> typing.Callable[[_TestFuncT], _TestFuncT]:
     return pytest.mark.skipif(
-        zstd is not None,
+        HAS_ZSTD,
         reason="only run if a python-zstandard library is not installed",
     )
 
@@ -181,6 +163,20 @@ def requires_network() -> typing.Callable[[_TestFuncT], _TestFuncT]:
             else:
                 raise
 
+    def _skip_if_no_route(f: _TestFuncT) -> _TestFuncT:
+        """Skip test exuction if network is unreachable"""
+
+        @wraps(f)
+        def wrapper(*args: typing.Any, **kwargs: typing.Any) -> typing.Any:
+            global _requires_network_has_route
+            if _requires_network_has_route is None:
+                _requires_network_has_route = _has_route()
+            if not _requires_network_has_route:
+                pytest.skip("Can't run the test because the network is unreachable")
+            return f(*args, **kwargs)
+
+        return typing.cast(_TestFuncT, wrapper)
+
     def _decorator_requires_internet(
         decorator: typing.Callable[[_TestFuncT], _TestFuncT]
     ) -> typing.Callable[[_TestFuncT], _TestFuncT]:
@@ -191,17 +187,7 @@ def requires_network() -> typing.Callable[[_TestFuncT], _TestFuncT]:
 
         return wrapper
 
-    global _requires_network_has_route
-
-    if _requires_network_has_route is None:
-        _requires_network_has_route = _has_route()
-
-    return _decorator_requires_internet(
-        pytest.mark.skipif(
-            not _requires_network_has_route,
-            reason="Can't run the test because the network is unreachable",
-        )
-    )
+    return _decorator_requires_internet(_skip_if_no_route)
 
 
 def resolvesLocalhostFQDN() -> typing.Callable[[_TestFuncT], _TestFuncT]:
@@ -213,7 +199,7 @@ def resolvesLocalhostFQDN() -> typing.Callable[[_TestFuncT], _TestFuncT]:
 
 
 def withPyOpenSSL(test: typing.Callable[..., _RT]) -> typing.Callable[..., _RT]:
-    @functools.wraps(test)
+    @wraps(test)
     def wrapper(*args: typing.Any, **kwargs: typing.Any) -> _RT:
         if not pyopenssl:
             pytest.skip("pyopenssl not available, skipping test.")
@@ -261,7 +247,7 @@ class LogRecorder:
         exc_type: type[BaseException] | None,
         exc_value: BaseException | None,
         traceback: TracebackType | None,
-    ) -> Literal[False]:
+    ) -> typing.Literal[False]:
         self.uninstall()
         return False
 
