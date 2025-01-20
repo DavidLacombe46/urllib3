@@ -9,9 +9,9 @@ from test import SHORT_TIMEOUT
 from unittest.mock import Mock, patch
 
 import pytest
-import socks as py_socks  # type: ignore[import]
+import socks as py_socks  # type: ignore[import-not-found]
 
-from dummyserver.server import DEFAULT_CA, DEFAULT_CERTS
+from dummyserver.socketserver import DEFAULT_CA, DEFAULT_CERTS
 from dummyserver.testcase import IPV4SocketDummyServerTestCase
 from urllib3.contrib import socks
 from urllib3.exceptions import ConnectTimeoutError, NewConnectionError
@@ -106,9 +106,7 @@ def _set_up_fake_getaddrinfo(monkeypatch: pytest.MonkeyPatch) -> None:
     # However, some tests need to exercise failure. We don't want retries there, but
     # can't affect PySocks retries via its API. Instead, we monkeypatch PySocks so that
     # it only sees a single address, which effectively disables retries.
-    def fake_getaddrinfo(
-        addr: str, port: int, family: int, socket_type: int
-    ) -> list[
+    def fake_getaddrinfo(addr: str, port: int, family: int, socket_type: int) -> list[
         tuple[
             socket.AddressFamily,
             socket.SocketKind,
