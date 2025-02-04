@@ -7,8 +7,11 @@ from unittest import mock
 
 import pytest
 
-from dummyserver.server import HAS_IPV6
-from dummyserver.testcase import HTTPDummyServerTestCase, IPv6HTTPDummyServerTestCase
+from dummyserver.socketserver import HAS_IPV6
+from dummyserver.testcase import (
+    HypercornDummyServerTestCase,
+    IPv6HypercornDummyServerTestCase,
+)
 from urllib3 import HTTPHeaderDict, HTTPResponse, request
 from urllib3.connectionpool import port_by_scheme
 from urllib3.exceptions import MaxRetryError, URLSchemeUnknown
@@ -16,7 +19,7 @@ from urllib3.poolmanager import PoolManager
 from urllib3.util.retry import Retry
 
 
-class TestPoolManager(HTTPDummyServerTestCase):
+class TestPoolManager(HypercornDummyServerTestCase):
     @classmethod
     def setup_class(cls) -> None:
         super().setup_class()
@@ -141,7 +144,11 @@ class TestPoolManager(HTTPDummyServerTestCase):
                 "GET",
                 f"{self.base_url}/redirect",
                 fields={"target": f"{self.base_url_alt}/headers"},
-                headers={"Authorization": "foo", "Cookie": "foo=bar"},
+                headers={
+                    "Authorization": "foo",
+                    "Proxy-Authorization": "bar",
+                    "Cookie": "foo=bar",
+                },
             )
 
             assert r.status == 200
@@ -149,13 +156,18 @@ class TestPoolManager(HTTPDummyServerTestCase):
             data = r.json()
 
             assert "Authorization" not in data
+            assert "Proxy-Authorization" not in data
             assert "Cookie" not in data
 
             r = http.request(
                 "GET",
                 f"{self.base_url}/redirect",
                 fields={"target": f"{self.base_url_alt}/headers"},
-                headers={"authorization": "foo", "cookie": "foo=bar"},
+                headers={
+                    "authorization": "foo",
+                    "proxy-authorization": "baz",
+                    "cookie": "foo=bar",
+                },
             )
 
             assert r.status == 200
@@ -164,6 +176,8 @@ class TestPoolManager(HTTPDummyServerTestCase):
 
             assert "authorization" not in data
             assert "Authorization" not in data
+            assert "proxy-authorization" not in data
+            assert "Proxy-Authorization" not in data
             assert "cookie" not in data
             assert "Cookie" not in data
 
@@ -173,7 +187,11 @@ class TestPoolManager(HTTPDummyServerTestCase):
                 "GET",
                 f"{self.base_url}/redirect",
                 fields={"target": f"{self.base_url_alt}/headers"},
-                headers={"Authorization": "foo", "Cookie": "foo=bar"},
+                headers={
+                    "Authorization": "foo",
+                    "Proxy-Authorization": "bar",
+                    "Cookie": "foo=bar",
+                },
                 retries=Retry(remove_headers_on_redirect=[]),
             )
 
@@ -182,6 +200,7 @@ class TestPoolManager(HTTPDummyServerTestCase):
             data = r.json()
 
             assert data["Authorization"] == "foo"
+            assert data["Proxy-Authorization"] == "bar"
             assert data["Cookie"] == "foo=bar"
 
     def test_redirect_cross_host_set_removed_headers(self) -> None:
@@ -193,6 +212,7 @@ class TestPoolManager(HTTPDummyServerTestCase):
                 headers={
                     "X-API-Secret": "foo",
                     "Authorization": "bar",
+                    "Proxy-Authorization": "baz",
                     "Cookie": "foo=bar",
                 },
                 retries=Retry(remove_headers_on_redirect=["X-API-Secret"]),
@@ -204,11 +224,13 @@ class TestPoolManager(HTTPDummyServerTestCase):
 
             assert "X-API-Secret" not in data
             assert data["Authorization"] == "bar"
+            assert data["Proxy-Authorization"] == "baz"
             assert data["Cookie"] == "foo=bar"
 
             headers = {
                 "x-api-secret": "foo",
                 "authorization": "bar",
+                "proxy-authorization": "baz",
                 "cookie": "foo=bar",
             }
             r = http.request(
@@ -226,12 +248,14 @@ class TestPoolManager(HTTPDummyServerTestCase):
             assert "x-api-secret" not in data
             assert "X-API-Secret" not in data
             assert data["Authorization"] == "bar"
+            assert data["Proxy-Authorization"] == "baz"
             assert data["Cookie"] == "foo=bar"
 
             # Ensure the header argument itself is not modified in-place.
             assert headers == {
                 "x-api-secret": "foo",
                 "authorization": "bar",
+                "proxy-authorization": "baz",
                 "cookie": "foo=bar",
             }
 
@@ -449,7 +473,7 @@ class TestPoolManager(HTTPDummyServerTestCase):
                 encode_multipart=True,
             )
             returned_headers = r.json()["headers"]
-            assert returned_headers[4:] == [
+            assert returned_headers[5:] == [
                 ["Multi", "1"],
                 ["Multi", "2"],
                 ["Content-Type", "multipart/form-data; boundary=b"],
@@ -467,7 +491,7 @@ class TestPoolManager(HTTPDummyServerTestCase):
                 encode_multipart=True,
             )
             returned_headers = r.json()["headers"]
-            assert returned_headers[4:] == [
+            assert returned_headers[5:] == [
                 ["Multi", "1"],
                 ["Multi", "2"],
                 # Uses the set value, not the one that would be generated.
@@ -497,10 +521,12 @@ class TestPoolManager(HTTPDummyServerTestCase):
     @pytest.mark.parametrize(
         ["target", "expected_target"],
         [
+            # annoyingly quart.request.full_path adds a stray `?`
+            ("/echo_uri", b"/echo_uri?"),
             ("/echo_uri?q=1#fragment", b"/echo_uri?q=1"),
             ("/echo_uri?#", b"/echo_uri?"),
-            ("/echo_uri#?", b"/echo_uri"),
-            ("/echo_uri#?#", b"/echo_uri"),
+            ("/echo_uri#!", b"/echo_uri?"),
+            ("/echo_uri#!#", b"/echo_uri?"),
             ("/echo_uri??#", b"/echo_uri??"),
             ("/echo_uri?%3f#", b"/echo_uri?%3F"),
             ("/echo_uri?%3F#", b"/echo_uri?%3F"),
@@ -614,18 +640,20 @@ class TestPoolManager(HTTPDummyServerTestCase):
         ],
     )
     def test_request_with_json(self, headers: HTTPHeaderDict) -> None:
+        old_headers = None if headers is None else headers.copy()
         body = {"attribute": "value"}
         r = request(
             method="POST", url=f"{self.base_url}/echo_json", headers=headers, json=body
         )
         assert r.status == 200
         assert r.json() == body
-        if headers is not None and "application/json" not in headers.values():
-            assert "text/plain" in r.headers["Content-Type"].replace(" ", "").split(",")
-        else:
-            assert "application/json" in r.headers["Content-Type"].replace(
-                " ", ""
-            ).split(",")
+        content_type = HTTPHeaderDict(old_headers).get(
+            "Content-Type", "application/json"
+        )
+        assert content_type in r.headers["Content-Type"].replace(" ", "").split(",")
+
+        # Ensure the header argument itself is not modified in-place.
+        assert headers == old_headers
 
     def test_top_level_request_with_json_with_httpheaderdict(self) -> None:
         body = {"attribute": "value"}
@@ -662,7 +690,7 @@ class TestPoolManager(HTTPDummyServerTestCase):
 
 
 @pytest.mark.skipif(not HAS_IPV6, reason="IPv6 is not supported on this system")
-class TestIPv6PoolManager(IPv6HTTPDummyServerTestCase):
+class TestIPv6PoolManager(IPv6HypercornDummyServerTestCase):
     @classmethod
     def setup_class(cls) -> None:
         super().setup_class()

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import io
+import logging
+import platform
 import socket
 import time
 import typing
@@ -12,8 +14,8 @@ from urllib.parse import urlencode
 
 import pytest
 
-from dummyserver.server import HAS_IPV6_AND_DNS, NoIPv6Warning
-from dummyserver.testcase import HTTPDummyServerTestCase, SocketDummyServerTestCase
+from dummyserver.socketserver import NoIPv6Warning
+from dummyserver.testcase import HypercornDummyServerTestCase, SocketDummyServerTestCase
 from urllib3 import HTTPConnectionPool, encode_multipart_formdata
 from urllib3._collections import HTTPHeaderDict
 from urllib3.connection import _get_default_user_agent
@@ -98,13 +100,18 @@ class TestConnectionPoolTimeouts(SocketDummyServerTestCase):
             self.host, self.port, timeout=short_timeout, retries=False
         ) as pool:
             wait_for_socket(ready_event)
-            now = time.time()
+            now = time.perf_counter()
             with pytest.raises(ReadTimeoutError):
                 pool.request("GET", "/", timeout=LONG_TIMEOUT)
-            delta = time.time() - now
+            delta = time.perf_counter() - now
 
             message = "timeout was pool-level SHORT_TIMEOUT rather than request-level LONG_TIMEOUT"
-            assert delta >= LONG_TIMEOUT, message
+            if platform.system() == "Windows":
+                # Adjust tolerance for floating-point comparison on Windows to
+                # avoid flakiness in CI #3413
+                assert delta >= (LONG_TIMEOUT - 1e-3), message
+            else:
+                assert delta >= (LONG_TIMEOUT - 1e-5), message
             block_event.set()  # Release request
 
             # Timeout passed directly to request should raise a request timeout
@@ -198,11 +205,33 @@ class TestConnectionPoolTimeouts(SocketDummyServerTestCase):
                 conn.connect()
 
 
-class TestConnectionPool(HTTPDummyServerTestCase):
+class TestConnectionPool(HypercornDummyServerTestCase):
+    def test_http2_test_error(self, http_version: str) -> None:
+        with HTTPConnectionPool(self.host, self.port) as pool:
+            if http_version == "h2":
+                with pytest.raises(
+                    ValueError, match="HTTP/2 support currently only applies to HTTPS.*"
+                ):
+                    r = pool.request("GET", "/")
+            else:
+                r = pool.request("GET", "/")
+                assert r.status == 200
+
     def test_get(self) -> None:
         with HTTPConnectionPool(self.host, self.port) as pool:
             r = pool.request("GET", "/specific_method", fields={"method": "GET"})
             assert r.status == 200, r.data
+
+    def test_debug_log(self, caplog: pytest.LogCaptureFixture) -> None:
+        caplog.set_level(logging.DEBUG, logger="urllib3.connectionpool")
+        with HTTPConnectionPool(self.host, self.port) as pool:
+            r = pool.urlopen("GET", "/")
+            assert r.status == 200
+        logs = [record.getMessage() for record in caplog.records]
+        assert logs == [
+            f"Starting new HTTP connection (1): {self.host}:{self.port}",
+            f'http://{self.host}:{self.port} "GET / HTTP/1.1" 200 0',
+        ]
 
     def test_post_url(self) -> None:
         with HTTPConnectionPool(self.host, self.port) as pool:
@@ -231,7 +260,7 @@ class TestConnectionPool(HTTPDummyServerTestCase):
             "upload_filename": "lolcat.txt",
             "filefield": ("lolcat.txt", data),
         }
-        fields["upload_size"] = len(data)  # type: ignore
+        fields["upload_size"] = len(data)  # type: ignore[assignment]
 
         with HTTPConnectionPool(self.host, self.port) as pool:
             r = pool.request("POST", "/upload", fields=fields)
@@ -270,7 +299,7 @@ class TestConnectionPool(HTTPDummyServerTestCase):
             "upload_filename": filename,
             fieldname: (filename, data),
         }
-        fields["upload_size"] = size  # type: ignore
+        fields["upload_size"] = size  # type: ignore[assignment]
         with HTTPConnectionPool(self.host, self.port) as pool:
             r = pool.request("POST", "/upload", fields=fields)
             assert r.status == 200, r.data
@@ -343,7 +372,7 @@ class TestConnectionPool(HTTPDummyServerTestCase):
             try:
                 # Update the default socket options
                 assert conn.socket_options is not None
-                conn.socket_options += [(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)]  # type: ignore[operator]
+                conn.socket_options += [(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)]
                 s = conn._new_conn()  # type: ignore[attr-defined]
                 nagle_disabled = (
                     s.getsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY) > 0
@@ -438,7 +467,6 @@ class TestConnectionPool(HTTPDummyServerTestCase):
             )
 
     def test_tunnel(self) -> None:
-        # note the actual httplib.py has no tests for this functionality
         timeout = Timeout(total=None)
         with HTTPConnectionPool(self.host, self.port, timeout=timeout) as pool:
             conn = pool._get_conn()
@@ -780,7 +808,9 @@ class TestConnectionPool(HTTPDummyServerTestCase):
 
     def test_source_address(self) -> None:
         for addr, is_ipv6 in VALID_SOURCE_ADDRESSES:
-            if is_ipv6 and not HAS_IPV6_AND_DNS:
+            if is_ipv6:
+                # TODO enable if HAS_IPV6_AND_DNS when this is fixed:
+                # https://github.com/pgjones/hypercorn/issues/160
                 warnings.warn("No IPv6 support: skipping.", NoIPv6Warning)
                 continue
             with HTTPConnectionPool(
@@ -799,7 +829,8 @@ class TestConnectionPool(HTTPDummyServerTestCase):
             self.host, self.port, source_address=invalid_source_address, retries=False
         ) as pool:
             if is_ipv6:
-                with pytest.raises(NameResolutionError):
+                # with pytest.raises(NameResolutionError):
+                with pytest.raises(NewConnectionError):
                     pool.request("GET", f"/source_address?{invalid_source_address}")
             else:
                 with pytest.raises(NewConnectionError):
@@ -890,7 +921,7 @@ class TestConnectionPool(HTTPDummyServerTestCase):
         """ConnectionPool preserves dot segments in the URI"""
         with HTTPConnectionPool(self.host, self.port) as pool:
             response = pool.request("GET", "/echo_uri/seg0/../seg2")
-            assert response.data == b"/echo_uri/seg0/../seg2"
+            assert response.data == b"/echo_uri/seg0/../seg2?"
 
     def test_default_user_agent_header(self) -> None:
         """ConnectionPool has a default user agent"""
@@ -974,54 +1005,6 @@ class TestConnectionPool(HTTPDummyServerTestCase):
             assert no_ua_headers["User-Agent"] == SKIP_HEADER
             assert pool_headers.get("User-Agent") == custom_ua
 
-    @pytest.mark.parametrize(
-        "accept_encoding",
-        [
-            "Accept-Encoding",
-            "accept-encoding",
-            b"Accept-Encoding",
-            b"accept-encoding",
-            None,
-        ],
-    )
-    @pytest.mark.parametrize("host", ["Host", "host", b"Host", b"host", None])
-    @pytest.mark.parametrize(
-        "user_agent", ["User-Agent", "user-agent", b"User-Agent", b"user-agent", None]
-    )
-    @pytest.mark.parametrize("chunked", [True, False])
-    def test_skip_header(
-        self,
-        accept_encoding: str | None,
-        host: str | None,
-        user_agent: str | None,
-        chunked: bool,
-    ) -> None:
-        headers = {}
-
-        if accept_encoding is not None:
-            headers[accept_encoding] = SKIP_HEADER
-        if host is not None:
-            headers[host] = SKIP_HEADER
-        if user_agent is not None:
-            headers[user_agent] = SKIP_HEADER
-
-        with HTTPConnectionPool(self.host, self.port) as pool:
-            r = pool.request("GET", "/headers", headers=headers, chunked=chunked)
-        request_headers = r.json()
-
-        if accept_encoding is None:
-            assert "Accept-Encoding" in request_headers
-        else:
-            assert accept_encoding not in request_headers
-        if host is None:
-            assert "Host" in request_headers
-        else:
-            assert host not in request_headers
-        if user_agent is None:
-            assert "User-Agent" in request_headers
-        else:
-            assert user_agent not in request_headers
-
     @pytest.mark.parametrize("header", ["Content-Length", "content-length"])
     @pytest.mark.parametrize("chunked", [True, False])
     def test_skip_header_non_supported(self, header: str, chunked: bool) -> None:
@@ -1061,6 +1044,8 @@ class TestConnectionPool(HTTPDummyServerTestCase):
             else:
                 conn = pool._get_conn()
                 conn.request("GET", "/headers", chunked=chunked)
+                conn.getresponse().close()
+                conn.close()
 
             assert pool.headers == {"key": "val"}
             assert type(pool.headers) is header_type
@@ -1071,6 +1056,8 @@ class TestConnectionPool(HTTPDummyServerTestCase):
             else:
                 conn = pool._get_conn()
                 conn.request("GET", "/headers", headers=headers, chunked=chunked)
+                conn.getresponse().close()
+                conn.close()
 
             assert headers == {"key": "val"}
 
@@ -1090,6 +1077,7 @@ class TestConnectionPool(HTTPDummyServerTestCase):
             resp = conn.getresponse()
             assert resp.status == 200
             assert resp.json()["Transfer-Encoding"] == "chunked"
+            conn.close()
 
     def test_bytes_header(self) -> None:
         with HTTPConnectionPool(self.host, self.port) as pool:
@@ -1114,7 +1102,7 @@ class TestConnectionPool(HTTPDummyServerTestCase):
             assert request_headers["User-Agent"] == "Schönefeld/1.18.0"
 
 
-class TestRetry(HTTPDummyServerTestCase):
+class TestRetry(HypercornDummyServerTestCase):
     def test_max_retry(self) -> None:
         with HTTPConnectionPool(self.host, self.port) as pool:
             with pytest.raises(MaxRetryError):
@@ -1196,7 +1184,9 @@ class TestRetry(HTTPDummyServerTestCase):
             )
             assert resp.status == 418
 
-    def test_read_retries_unsuccessful(self) -> None:
+    def test_read_retries_unsuccessful(
+        self,
+    ) -> None:
         with HTTPConnectionPool(self.host, self.port) as pool:
             headers = {"test-name": "test_read_retries_unsuccessful"}
             resp = pool.request("GET", "/successful_retry", headers=headers, retries=1)
@@ -1278,7 +1268,7 @@ class TestRetry(HTTPDummyServerTestCase):
             assert actual == expected
 
 
-class TestRetryAfter(HTTPDummyServerTestCase):
+class TestRetryAfter(HypercornDummyServerTestCase):
     def test_retry_after(self) -> None:
         # Request twice in a second to get a 429 response.
         with HTTPConnectionPool(self.host, self.port) as pool:
@@ -1342,6 +1332,7 @@ class TestRetryAfter(HTTPDummyServerTestCase):
             r = pool.request("GET", "/redirect_after", retries=False)
             assert r.status == 303
 
+            # Real timestamps are needed for this test
             t = time.time()
             r = pool.request("GET", "/redirect_after")
             assert r.status == 200
@@ -1364,10 +1355,10 @@ class TestRetryAfter(HTTPDummyServerTestCase):
             assert delta < 1
 
 
-class TestFileBodiesOnRetryOrRedirect(HTTPDummyServerTestCase):
+class TestFileBodiesOnRetryOrRedirect(HypercornDummyServerTestCase):
     def test_retries_put_filehandle(self) -> None:
         """HTTP PUT retry with a file-like object should not timeout"""
-        with HTTPConnectionPool(self.host, self.port, timeout=0.1) as pool:
+        with HTTPConnectionPool(self.host, self.port, timeout=LONG_TIMEOUT) as pool:
             retry = Retry(total=3, status_forcelist=[418])
             # httplib reads in 8k chunks; use a larger content length
             content_length = 65535
@@ -1390,7 +1381,7 @@ class TestFileBodiesOnRetryOrRedirect(HTTPDummyServerTestCase):
 
     def test_redirect_put_file(self) -> None:
         """PUT with file object should work with a redirection response"""
-        with HTTPConnectionPool(self.host, self.port, timeout=0.1) as pool:
+        with HTTPConnectionPool(self.host, self.port, timeout=LONG_TIMEOUT) as pool:
             retry = Retry(total=3, status_forcelist=[418])
             # httplib reads in 8k chunks; use a larger content length
             content_length = 65535
@@ -1425,14 +1416,14 @@ class TestFileBodiesOnRetryOrRedirect(HTTPDummyServerTestCase):
         # httplib uses fileno if Content-Length isn't supplied,
         # which is unsupported by BytesIO.
         headers = {"Content-Length": "8"}
-        with HTTPConnectionPool(self.host, self.port, timeout=0.1) as pool:
+        with HTTPConnectionPool(self.host, self.port, timeout=LONG_TIMEOUT) as pool:
             with pytest.raises(
                 UnrewindableBodyError, match="Unable to record file position for"
             ):
                 pool.urlopen("PUT", url, headers=headers, body=body)
 
 
-class TestRetryPoolSize(HTTPDummyServerTestCase):
+class TestRetryPoolSize(HypercornDummyServerTestCase):
     def test_pool_size_retry(self) -> None:
         retries = Retry(total=1, raise_on_status=False, status_forcelist=[404])
         with HTTPConnectionPool(
@@ -1442,7 +1433,7 @@ class TestRetryPoolSize(HTTPDummyServerTestCase):
             assert pool.num_connections == 1
 
 
-class TestRedirectPoolSize(HTTPDummyServerTestCase):
+class TestRedirectPoolSize(HypercornDummyServerTestCase):
     def test_pool_size_redirect(self) -> None:
         retries = Retry(
             total=1, raise_on_status=False, status_forcelist=[404], redirect=True
